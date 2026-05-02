@@ -37,7 +37,10 @@ static CONNECTION_POOL: OnceCell<RwLock<HashMap<String, Arc<ServerHandle>>>> =
 //
 // # 参数
 // * `servers` - 服务器配置向量
-pub async fn init_connections(servers: Vec<Server>) -> Vec<JoinHandle<()>> {
+pub async fn init_connections(
+    servers: Vec<Server>,
+    connect_timeout: Duration,
+) -> Vec<JoinHandle<()>> {
     let mut map = HashMap::new();
     let mut handles = Vec::new();
 
@@ -57,6 +60,7 @@ pub async fn init_connections(servers: Vec<Server>) -> Vec<JoinHandle<()>> {
             server,
             uplink_rx,
             downlink_tx,
+            connect_timeout,
         )));
     }
 
@@ -86,6 +90,7 @@ async fn connection_manager(
     server: Server,
     mut uplink_rx: broadcast::Receiver<Message>,
     downlink_tx: broadcast::Sender<Message>,
+    connect_timeout: Duration,
 ) {
     // 临时定义用于检测 JsonRpc 长连接错误
     #[derive(Deserialize)]
@@ -108,7 +113,7 @@ async fn connection_manager(
     loop {
         info!("[{name}] Connecting to {url}...");
 
-        let ws_stream = match connect_with_retry(name, url).await {
+        let ws_stream = match connect_with_retry(name, url, connect_timeout).await {
             Ok(ws) => ws,
             Err(e) => {
                 error!("[{name}] Failed to connect: {e}");
@@ -266,16 +271,20 @@ async fn connection_manager(
 async fn connect_with_retry(
     name: &str,
     url: &str,
+    connect_timeout: Duration,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let mut retry_count = 0;
     loop {
-        match timeout(Duration::from_secs(5), connect_async(url)).await {
+        match timeout(connect_timeout, connect_async(url)).await {
             Ok(Ok((ws_stream, _))) => return Ok(ws_stream),
             Ok(Err(e)) => {
                 warn!("[{name}] Connect failed: {e}");
             }
             Err(_) => {
-                warn!("[{name}] Connect timeout");
+                warn!(
+                    "[{name}] Connect timeout after {}ms",
+                    connect_timeout.as_millis()
+                );
             }
         }
 

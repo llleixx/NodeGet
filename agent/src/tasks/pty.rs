@@ -5,8 +5,8 @@ use nodeget_lib::error::NodegetError;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::{
     sync::{RwLock, mpsc},
@@ -45,6 +45,22 @@ async fn release_terminal_id(terminal_id: &str) {
     guard.remove(terminal_id);
 }
 
+fn configured_terminal_shell() -> Option<String> {
+    let config = AGENT_CONFIG.get()?;
+    let guard = config.read().ok()?;
+    guard.resolved_terminal_shell().map(str::to_owned)
+}
+
+fn default_terminal_shell() -> &'static str {
+    if cfg!(windows) {
+        "cmd.exe"
+    } else if Path::new("/bin/bash").exists() {
+        "bash"
+    } else {
+        "sh"
+    }
+}
+
 // Handle PTY (pseudo terminal) websocket URL.
 //
 // This function connects to the target websocket URL and starts a PTY session.
@@ -77,15 +93,10 @@ pub async fn handle_pty_url(
 
         let ws_stream = ws.0;
 
-        let cmd = if cfg!(windows) {
-            "cmd.exe"
-        } else if fs::exists("/bin/bash").unwrap_or(false) {
-            "bash"
-        } else {
-            "sh"
-        };
+        let cmd =
+            configured_terminal_shell().unwrap_or_else(|| default_terminal_shell().to_owned());
 
-        handle_pty_session(ws_stream, cmd).await
+        handle_pty_session(ws_stream, &cmd).await
     }
     .await;
 

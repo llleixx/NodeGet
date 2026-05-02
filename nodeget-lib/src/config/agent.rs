@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use tokio::fs;
 
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 1000;
+pub const DEFAULT_NTP_SERVER: &str = "time.pool.aliyun.com";
+
 // Agent 配置结构体，定义 Agent 的运行参数
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentConfig {
@@ -33,7 +36,7 @@ pub struct AgentConfig {
     // IP 地址获取服务提供商
     pub ip_provider: Option<IpProvider>,
 
-    // NTP 服务器地址，默认使用 pool.ntp.org
+    // NTP 服务器地址，默认使用 time.pool.aliyun.com
     pub ntp_server: Option<String>,
 
     // 服务器列表
@@ -88,9 +91,32 @@ pub enum IpProvider {
 }
 
 impl AgentConfig {
+    #[must_use]
+    pub fn resolved_connect_timeout_ms(&self) -> u64 {
+        self.connect_timeout_ms
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS)
+    }
+
+    #[must_use]
+    pub fn resolved_ntp_server(&self) -> &str {
+        self.ntp_server
+            .as_deref()
+            .map(str::trim)
+            .filter(|server| !server.is_empty())
+            .unwrap_or(DEFAULT_NTP_SERVER)
+    }
+
+    #[must_use]
+    pub fn resolved_terminal_shell(&self) -> Option<&str> {
+        self.terminal_shell
+            .as_deref()
+            .map(str::trim)
+            .filter(|shell| !shell.is_empty())
+    }
+
     /// 从指定路径读取并解析代理配置
     ///
-    /// 若配置文件中 `agent_uuid` 为 `"auto_gen"`，则会生成随机 UUIDv4
+    /// 若配置文件中 `agent_uuid` 为 `"auto_gen"`，则会生成随机 `UUIDv4`
     /// 并直接覆盖原配置文件，后续启动不再触发自动生成。
     ///
     /// # Errors
@@ -106,7 +132,7 @@ impl AgentConfig {
         let is_auto_gen = value
             .get("agent_uuid")
             .and_then(|v| v.as_str())
-            .map_or(false, |s| s.eq_ignore_ascii_case("auto_gen"));
+            .is_some_and(|s| s.eq_ignore_ascii_case("auto_gen"));
 
         let config_content = if is_auto_gen {
             let new_uuid = uuid::Uuid::new_v4().to_string();
@@ -121,26 +147,26 @@ impl AgentConfig {
                 let key_end = trimmed
                     .find(|c: char| c == '=' || c.is_ascii_whitespace())
                     .unwrap_or(trimmed.len());
-                if key_end == 10 && trimmed[..key_end].eq_ignore_ascii_case("agent_uuid") {
-                    if let Some(eq_pos) = line.find('=') {
-                        let before = &line[..eq_pos + 1];
-                        let after = &line[eq_pos + 1..];
-                        let after_trimmed = after.trim_start();
-                        if let Some(first_char) = after_trimmed.chars().next() {
-                            if first_char == '\"' || first_char == '\'' {
-                                let rest = &after_trimmed[1..];
-                                if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case("auto_gen")
-                                {
-                                    let after_value = &rest[8..];
-                                    new_content.push_str(before);
-                                    new_content.push(' ');
-                                    new_content.push(first_char);
-                                    new_content.push_str(&new_uuid);
-                                    new_content.push_str(after_value);
-                                    new_content.push('\n');
-                                    continue;
-                                }
-                            }
+                if key_end == 10
+                    && trimmed[..key_end].eq_ignore_ascii_case("agent_uuid")
+                    && let Some(eq_pos) = line.find('=')
+                {
+                    let before = &line[..=eq_pos];
+                    let after = &line[eq_pos + 1..];
+                    let after_trimmed = after.trim_start();
+                    if let Some(first_char) = after_trimmed.chars().next()
+                        && (first_char == '"' || first_char == '\'')
+                    {
+                        let rest = &after_trimmed[1..];
+                        if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case("auto_gen") {
+                            let after_value = &rest[8..];
+                            new_content.push_str(before);
+                            new_content.push(' ');
+                            new_content.push(first_char);
+                            new_content.push_str(&new_uuid);
+                            new_content.push_str(after_value);
+                            new_content.push('\n');
+                            continue;
                         }
                     }
                 }
@@ -154,6 +180,10 @@ impl AgentConfig {
         };
 
         let config: Self = toml::from_str(&config_content)?;
+
+        if config.connect_timeout_ms == Some(0) {
+            return Err("connect_timeout_ms must be greater than 0".into());
+        }
 
         // 校验 server name 不能重复
         if let Some(servers) = &config.server {
@@ -181,5 +211,50 @@ impl AgentConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentConfig, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_NTP_SERVER};
+
+    fn minimal_config() -> AgentConfig {
+        AgentConfig {
+            log_level: Some("info".to_owned()),
+            dynamic_report_interval_ms: None,
+            dynamic_summary_report_interval_ms: None,
+            static_report_interval_ms: None,
+            agent_uuid: uuid::Uuid::nil(),
+            connect_timeout_ms: None,
+            exec_max_character: None,
+            terminal_shell: None,
+            ip_provider: None,
+            ntp_server: None,
+            server: None,
+        }
+    }
+
+    #[test]
+    fn resolved_defaults_match_documented_values() {
+        let config = minimal_config();
+
+        assert_eq!(
+            config.resolved_connect_timeout_ms(),
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(config.resolved_ntp_server(), DEFAULT_NTP_SERVER);
+        assert_eq!(config.resolved_terminal_shell(), None);
+    }
+
+    #[test]
+    fn resolved_values_trim_configured_strings() {
+        let mut config = minimal_config();
+        config.connect_timeout_ms = Some(2500);
+        config.ntp_server = Some(" ntp.example.com ".to_owned());
+        config.terminal_shell = Some(" /usr/bin/zsh ".to_owned());
+
+        assert_eq!(config.resolved_connect_timeout_ms(), 2500);
+        assert_eq!(config.resolved_ntp_server(), "ntp.example.com");
+        assert_eq!(config.resolved_terminal_shell(), Some("/usr/bin/zsh"));
     }
 }
